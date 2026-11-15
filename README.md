@@ -2,6 +2,10 @@
 
 A small Wi-Fi temperature and humidity monitor for an **ESP-01S and ESP-01S DHT11 v1.0 carrier**. Open its local webpage for live readings and recent history. After the first USB installation, firmware updates can run over Wi-Fi with a device-specific password.
 
+![Live ESP-01S dashboard showing humidity, temperature, uptime and 24-hour history charts](docs/images/dashboard.jpg)
+
+*Captured from the running sensor on 15 November 2026. Readings and charts show the device's state at capture time.*
+
 ## Features
 
 - Temperature and relative humidity sampled every five seconds.
