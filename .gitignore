@@ -1,0 +1,16 @@
+build/
+build-local/
+sketchbook/
+*.log
+backups/
+secrets/
+HumiditySensor/ota_secrets.h
+vendor/
+exports/
+SETUP.txt
+OTA.txt
+ota-verification.json
+reliability-check.json
+__pycache__/
+*.pyc
+.DS_Store

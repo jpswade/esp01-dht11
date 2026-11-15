@@ -1,0 +1,19 @@
+{
+  "libraries": [
+    {
+      "directory": "WiFiManager-2.0.17",
+      "url": "https://codeload.github.com/tzapu/WiFiManager/zip/refs/tags/v2.0.17",
+      "sha256": "1dc3b202bc4f959a49635ddc22183ce43a267a77a0efa374bc284c3bd7536da8"
+    },
+    {
+      "directory": "DHT-sensor-library-1.4.6",
+      "url": "https://codeload.github.com/adafruit/DHT-sensor-library/zip/refs/tags/1.4.6",
+      "sha256": "c62c2a80337d53fc6b480b9644916217ad73ea52cc9a4665ed9184a583503224"
+    },
+    {
+      "directory": "Adafruit_Sensor-1.1.15",
+      "url": "https://codeload.github.com/adafruit/Adafruit_Sensor/zip/refs/tags/1.1.15",
+      "sha256": "95556ec61cd92df3e15c450d8febed64284d0b5416ce3ac0891fab326130b3c7"
+    }
+  ]
+}
