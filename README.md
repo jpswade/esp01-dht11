@@ -85,10 +85,19 @@ Use the same trusted local network. ArduinoOTA uses password-based Digest-MD5 au
 | `/api/readings` | `ok`, `humidity_percent`, `temperature_c`, `sample_age_ms`, `uptime_ms` |
 | `/api/history` | `interval_ms`, `window_ms`, chronological `readings` with sample ages and measurements |
 | `/api/device` | Firmware identifier, OTA availability, hostname, sketch size and free update space |
+| `/api/diagnostics` | Boot reset reason, recorded restart intent, heap health, Wi-Fi signal and observed disconnects |
 
 Live sensor failures return HTTP 503 and null measurements. History retains null entries as gaps. Measurements are available without authentication on the local network; OTA uploads require the generated password. No credentials or password hashes are returned by the API.
 
 Sample times are derived from ages, not an ESP real-time clock. The dashboard uses the browser's clock to label the charts. Save the export time alongside a history export if you need approximate absolute timestamps later.
+
+### Investigating restarts
+
+The firmware deliberately reboots after three minutes continuously disconnected from Wi-Fi. It also reboots after provisioning times out or an OTA update succeeds. These can clear history without an application crash.
+
+Starting with `history-uptime-v5`, `/api/diagnostics` reports the core's reset reason and reset information, plus a marker for the last intentional reboot (`wifi_timeout`, `setup_timeout`, `ota_update`, or `none_recorded`). Markers and a boot counter use checksummed RTC memory outside the area reserved for OTA. RTC data can be lost on power removal; the counter is not an all-time reboot count, and `none_recorded` does not by itself prove a power fault or crash. The first upgrade from older firmware cannot recover an earlier reset cause.
+
+Heap fields report current free memory, the minimum observed at loop boundaries, largest free block and fragmentation. Wi-Fi disconnects count transitions observed by the main loop, so brief events may be missed. These diagnostics help distinguish later faults; they do not establish a cause without observing the failure. Wi-Fi light sleep and recovery behaviour are unchanged in this diagnostic build.
 
 ## Measurement accuracy
 

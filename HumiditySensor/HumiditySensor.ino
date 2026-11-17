@@ -5,6 +5,7 @@
 #include <WiFiManager.h>
 #include <DHT.h>
 #include "RecentHistory.h"
+#include "RestartRecord.h"
 #include "ota_secrets.h"
 static_assert(sizeof(OTA_PASSWORD_HASH) == 33, "OTA requires a 32-character password hash");
 
@@ -19,6 +20,55 @@ unsigned long sampledAt = 0, disconnectedAt = 0;
 bool disconnected = false;
 String hostname;
 RecentHistory history;
+// RTC offsets are 4-byte words. Keep clear of the first 128 bytes used by OTA.
+constexpr uint32_t RESTART_RTC_OFFSET = 64;
+RestartRecord restartRecord = {};
+RestartIntent previousRestartIntent = RestartIntent::None;
+bool rtcRecordValid = false, rtcWriteOK = false;
+String bootResetReason, bootResetInfo;
+uint32_t minFreeHeap = UINT32_MAX, wifiDisconnects = 0;
+
+void markRestart(RestartIntent intent) {
+  restartRecord = makeRestartRecord(restartRecord.boots, intent);
+  rtcWriteOK = ESP.rtcUserMemoryWrite(RESTART_RTC_OFFSET,
+    reinterpret_cast<uint32_t*>(&restartRecord), sizeof(restartRecord));
+}
+
+void appendJsonString(String& json, const String& value) {
+  json += '"';
+  for (unsigned i = 0; i < value.length(); ++i) {
+    const uint8_t c = value[i];
+    if (c == '"' || c == '\\') { json += '\\'; json += char(c); }
+    else if (c < 32) {
+      const char hex[] = "0123456789abcdef";
+      json += "\\u00"; json += hex[c >> 4]; json += hex[c & 15];
+    } else json += char(c);
+  }
+  json += '"';
+}
+
+void sendDiagnostics() {
+  String json;
+  json.reserve(768);
+  json = "{\"reset_reason\":"; appendJsonString(json, bootResetReason);
+  json += ",\"reset_info\":"; appendJsonString(json, bootResetInfo);
+  json += ",\"previous_restart_intent\":";
+  appendJsonString(json, restartIntentName(previousRestartIntent));
+  json += ",\"rtc_record_valid_at_boot\":"; json += rtcRecordValid ? "true" : "false";
+  json += ",\"rtc_write_ok\":"; json += rtcWriteOK ? "true" : "false";
+  json += ",\"boot_count_rtc\":" + String(restartRecord.boots);
+  json += ",\"uptime_ms\":" + String(millis());
+  json += ",\"free_heap_bytes\":" + String(ESP.getFreeHeap());
+  json += ",\"min_observed_free_heap_bytes\":" + String(minFreeHeap);
+  json += ",\"largest_free_block_bytes\":" + String(ESP.getMaxFreeBlockSize());
+  json += ",\"heap_fragmentation_percent\":" + String(ESP.getHeapFragmentation());
+  json += ",\"wifi_disconnects_observed\":" + String(wifiDisconnects);
+  json += ",\"wifi_status\":" + String(unsigned(WiFi.status()));
+  json += ",\"wifi_rssi_dbm\":" + String(WiFi.RSSI());
+  json += ",\"wifi_sleep_mode\":" + String(unsigned(WiFi.getSleepMode())) + "}";
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", json);
+}
 
 const char PAGE[] PROGMEM = R"HTML(<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
@@ -135,6 +185,14 @@ void sendReadings() {
 }
 
 void setup() {
+  bootResetReason = ESP.getResetReason();
+  bootResetInfo = ESP.getResetInfo();
+  rtcRecordValid = ESP.rtcUserMemoryRead(RESTART_RTC_OFFSET,
+    reinterpret_cast<uint32_t*>(&restartRecord), sizeof(restartRecord)) && validRestartRecord(restartRecord);
+  if (!rtcRecordValid) restartRecord = {};
+  previousRestartIntent = beginBootRecord(restartRecord);
+  markRestart(RestartIntent::None);
+  minFreeHeap = ESP.getFreeHeap();
   Serial.begin(115200);
   Serial.println();
   hostname = "humidity-" + String(ESP.getChipId(), HEX);
@@ -152,6 +210,7 @@ void setup() {
   if (!manager.autoConnect(apName.c_str(), "humidity-setup")) {
     Serial.println("Setup timed out; restarting.");
     delay(1000);
+    markRestart(RestartIntent::SetupTimeout);
     ESP.restart();
     return;
   }
@@ -164,7 +223,10 @@ void setup() {
   ArduinoOTA.setPort(8266);
   ArduinoOTA.setPasswordHash(OTA_PASSWORD_HASH);
   ArduinoOTA.onStart([]() { Serial.println("Authenticated OTA update starting."); });
-  ArduinoOTA.onEnd([]() { Serial.println("OTA complete; restarting."); });
+  ArduinoOTA.onEnd([]() {
+    markRestart(RestartIntent::OtaUpdate);
+    Serial.println("OTA complete; restarting.");
+  });
   ArduinoOTA.onError([](ota_error_t error) {
     Serial.printf("OTA failed (error %u); sensor continues running.\n", unsigned(error));
   });
@@ -176,8 +238,9 @@ void setup() {
   });
   server.on("/api/readings", HTTP_GET, sendReadings);
   server.on("/api/history", HTTP_GET, sendHistory);
+  server.on("/api/diagnostics", HTTP_GET, sendDiagnostics);
   server.on("/api/device", HTTP_GET, []() {
-    String json = "{\"firmware\":\"history-uptime-v4\",\"ota_enabled\":true,\"hostname\":\"";
+    String json = "{\"firmware\":\"history-uptime-v5\",\"ota_enabled\":true,\"hostname\":\"";
     json += hostname + "\",\"sketch_size\":" + String(ESP.getSketchSize());
     json += ",\"free_sketch_space\":" + String(ESP.getFreeSketchSpace());
     json += ",\"wifi_sleep_mode\":" + String(unsigned(WiFi.getSleepMode()));
@@ -193,15 +256,20 @@ void setup() {
 }
 
 void loop() {
+  const uint32_t freeHeap = ESP.getFreeHeap();
+  if (freeHeap < minFreeHeap) minFreeHeap = freeHeap;
   ArduinoOTA.handle(); // Includes mDNS updates; sampling pauses during an upload.
   server.handleClient();
   if (millis() - sampledAt >= SAMPLE_MS) sampleSensor();
   if (WiFi.status() == WL_CONNECTED) {
     disconnected = false;
   } else {
-    if (!disconnected) { disconnectedAt = millis(); disconnected = true; }
+    if (!disconnected) { disconnectedAt = millis(); disconnected = true; ++wifiDisconnects; }
     // Reopen the setup portal after a prolonged outage or changed Wi-Fi.
-    if (millis() - disconnectedAt >= 180000) ESP.restart();
+    if (millis() - disconnectedAt >= 180000) {
+      markRestart(RestartIntent::WifiTimeout);
+      ESP.restart();
+    }
   }
   // Allow a full router beacon interval for sleep; requests wait at most one second.
   delay(1000);
