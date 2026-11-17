@@ -8,4 +8,6 @@ c++ -std=c++11 -Wall -Wextra -pedantic "$PROJECT_DIR/tests/history_test.cpp" -o 
 c++ -std=c++11 -Wall -Wextra -pedantic "$PROJECT_DIR/tests/restart_record_test.cpp" -o "$TEST_BINARY"
 "$TEST_BINARY"
 node "$PROJECT_DIR/tests/chart_test.cjs"
+c++ -std=c++11 -Wall -Wextra -pedantic "$PROJECT_DIR/tests/history_import_test.cpp" -o "$TEST_BINARY"
+"$TEST_BINARY"
 python3 -B -m unittest discover -s "$PROJECT_DIR/tests" -p 'test_*.py'

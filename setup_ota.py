@@ -18,6 +18,8 @@ if len(password) < 20:
     raise SystemExit("OTA password is missing or too short; check " + str(password_file))
 digest = hashlib.md5(password.encode()).hexdigest()
 header = project / "HumiditySensor" / "ota_secrets.h"
-header.write_text('#pragma once\n#define OTA_PASSWORD_HASH "' + digest + '"\n')
+history_digest = hashlib.md5(("history:humidity-history:" + password).encode()).hexdigest()
+header.write_text('#pragma once\n#define OTA_PASSWORD_HASH "' + digest +
+                  '"\n#define HISTORY_AUTH_HASH "' + history_digest + '"\n')
 header.chmod(0o600)
 print("OTA password saved at " + str(password_file) + "; existing password retained if present.")
