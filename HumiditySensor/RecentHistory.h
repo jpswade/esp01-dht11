@@ -22,6 +22,15 @@ class RecentHistory {
   }
 
   uint16_t size() const { return count_; }
+  // Import validated chronological readings without changing their sample ages.
+  bool appendRestored(uint32_t now, uint32_t age, float humidity, float temperature) {
+    if (age > WINDOW_MS || count_ >= CAPACITY) return false;
+    readings_[next_] = {uint32_t(now - age), humidity, temperature};
+    next_ = (next_ + 1) % CAPACITY;
+    ++count_;
+    lastAt_ = now - age;
+    return true;
+  }
   const HistoryReading& at(uint16_t chronologicalIndex) const {
     return readings_[(next_ + CAPACITY - count_ + chronologicalIndex) % CAPACITY];
   }

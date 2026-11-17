@@ -17,7 +17,7 @@ A small Wi-Fi temperature and humidity monitor for an **ESP-01S and ESP-01S DHT1
 - Password-protected ArduinoOTA updates, with a helper that keeps the password out of command-line arguments and logs.
 - Explicit gaps for failed sensor readings rather than stale measurements.
 
-History is held in RAM (up to 289 points). Restarting, unplugging or updating the ESP clears it. Export `/api/history` before a restart if you want to keep the readings.
+History is held in RAM (up to 289 points). Restarting or unplugging clears it. The OTA helper can preserve and restore the history around an update with `--preserve-history`; a raw/manual OTA update still clears it.
 
 ## Hardware
 
@@ -64,7 +64,7 @@ After the OTA-enabled build has been installed over USB:
 
 ```sh
 sh build.sh
-python3 upload_ota.py --host humidity-YOUR_CHIP_ID.local --expected-hostname humidity-YOUR_CHIP_ID
+python3 upload_ota.py --host humidity-YOUR_CHIP_ID.local --expected-hostname humidity-YOUR_CHIP_ID --preserve-history
 ```
 
 An IP address works with `--host` too. For repeated use, you can save defaults locally in the ignored `secrets/device.json`:
@@ -77,6 +77,8 @@ Then `python3 upload_ota.py` uses those defaults. The helper checks firmware com
 
 Use the same trusted local network. ArduinoOTA uses password-based Digest-MD5 authentication, not TLS or signed firmware. The ESP listens on UDP 8266 and connects back to a temporary TCP listener on the uploading computer. Keep OTA support in future builds. Successful updates reboot, preserve saved Wi-Fi settings and clear RAM history.
 
+With `--preserve-history`, the helper first saves and reads back a local JSON backup, then restores the still-recent points and any new startup samples after reboot. Restore-capable firmware (`history-uptime-v6` onward) must be the image being installed. Run `setup_ota.py` again before building an older checkout to add its history-authentication hash; the saved OTA password is retained. Restoration uses HTTP Digest authentication with that same password, a fixed-size streaming parser and at most 289 records. Invalid or unauthenticated imports do not replace the current history. Natural 24-hour expiry and bounded capacity still apply. The helper verifies the restored count and values; if restoration fails, it reports an error and retains the local backup.
+
 ## API
 
 | Endpoint | Response |
@@ -85,10 +87,23 @@ Use the same trusted local network. ArduinoOTA uses password-based Digest-MD5 au
 | `/api/readings` | `ok`, `humidity_percent`, `temperature_c`, `sample_age_ms`, `uptime_ms` |
 | `/api/history` | `interval_ms`, `window_ms`, chronological `readings` with sample ages and measurements |
 | `/api/device` | Firmware identifier, OTA availability, hostname, sketch size and free update space |
+| `/api/diagnostics` | Boot reset reason, recorded restart intent, heap health, Wi-Fi signal and observed disconnects |
+| `/api/debug/heap` | Last 48 one-minute heap/Wi-Fi samples in a fixed-size RAM ring |
+| `/api/history/restore` | Digest-authenticated multipart binary history import used by the OTA helper |
 
 Live sensor failures return HTTP 503 and null measurements. History retains null entries as gaps. Measurements are available without authentication on the local network; OTA uploads require the generated password. No credentials or password hashes are returned by the API.
 
 Sample times are derived from ages, not an ESP real-time clock. The dashboard uses the browser's clock to label the charts. Save the export time alongside a history export if you need approximate absolute timestamps later.
+
+### Investigating restarts
+
+The firmware deliberately reboots after three minutes continuously disconnected from Wi-Fi. It also reboots after provisioning times out or an OTA update succeeds. These can clear history without an application crash.
+
+Starting with `history-uptime-v5`, `/api/diagnostics` reports the core's reset reason and reset information, plus a marker for the last intentional reboot (`wifi_timeout`, `setup_timeout`, `ota_update`, or `none_recorded`). Markers and a boot counter use checksummed RTC memory outside the area reserved for OTA. RTC data can be lost on power removal; the counter is not an all-time reboot count, and `none_recorded` does not by itself prove a power fault or crash. The first upgrade from older firmware cannot recover an earlier reset cause.
+
+Heap fields report current free memory, the minimum observed at loop boundaries, largest free block and fragmentation. Wi-Fi disconnects count transitions observed by the main loop, so brief events may be missed. These diagnostics help distinguish later faults; they do not establish a cause without observing the failure. Wi-Fi light sleep and recovery behaviour are unchanged in this diagnostic build.
+
+Debug logging does not append files to flash. Its 48-point RAM ring overwrites old records; history remains capped at 289 points. Compile-time checks limit the combined history/import/log/output buffers to 10 KB. History responses use a fixed 1 KB output buffer. Large endpoints return HTTP 503 when free heap is below 8 KB or the largest free block is below 4 KB. The uploader checks available OTA space before writing. These bounds prevent log growth, but do not prove an unrelated crash or power fault is fixed; inspect `/api/diagnostics` and the heap trend over time.
 
 ## Measurement accuracy
 

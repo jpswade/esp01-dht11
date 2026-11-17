@@ -20,6 +20,7 @@ def main():
     parser.add_argument("--host", default=config.get("host"), help="Sensor IP or .local hostname")
     parser.add_argument("--expected-hostname", default=config.get("hostname"), help="Optional exact device identity check")
     parser.add_argument("--espota", type=Path, help="Path to the ESP8266 core's espota.py")
+    parser.add_argument("--preserve-history", action="store_true", help="Back up history before OTA and restore it after reboot")
     args = parser.parse_args()
     if not args.host:
         parser.error("Specify --host or save host/hostname in secrets/device.json.")
@@ -30,8 +31,11 @@ def main():
     password = password_file.read_text().strip()
     if not password:
         parser.error("OTA password file is empty.")
-    if hashlib.md5(password.encode()).hexdigest().encode() not in image.read_bytes():
+    image_bytes = image.read_bytes()
+    if hashlib.md5(password.encode()).hexdigest().encode() not in image_bytes:
         parser.error("Built firmware does not contain the saved password hash; rebuild before uploading.")
+    if args.preserve_history and b'"history_restore":true' not in image_bytes:
+        parser.error("This image does not advertise history restore; refusing to clear history for this upload.")
     remote_ip = socket.gethostbyname(args.host)
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     with opener.open("http://" + remote_ip + "/api/device", timeout=10) as response:
@@ -55,9 +59,17 @@ def main():
         route.connect((remote_ip, 8266))
         local_ip = route.getsockname()[0]
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    snapshot = None
+    if args.preserve_history:
+        from history_transfer import save_history
+        snapshot = save_history("http://" + remote_ip, project / "exports")
     # Call the official uploader in-process so the password stays out of argv/logs.
-    return espota.serve(remote_ip, local_ip, 8266, 10000 + secrets.randbelow(50000),
-                        password, str(image), espota.FLASH)
+    result = espota.serve(remote_ip, local_ip, 8266, 10000 + secrets.randbelow(50000),
+                          password, str(image), espota.FLASH)
+    if result == 0 and snapshot is not None:
+        from history_transfer import restore_history
+        restore_history("http://" + remote_ip, password, snapshot)
+    return result
 
 
 if __name__ == "__main__":

@@ -5,8 +5,11 @@
 #include <WiFiManager.h>
 #include <DHT.h>
 #include "RecentHistory.h"
+#include "RestartRecord.h"
+#include "HistoryImport.h"
 #include "ota_secrets.h"
 static_assert(sizeof(OTA_PASSWORD_HASH) == 33, "OTA requires a 32-character password hash");
+static_assert(sizeof(HISTORY_AUTH_HASH) == 33, "Run setup_ota.py to configure authenticated history restore");
 
 // ESP-01S DHT11 v1.0 carrier: data is normally wired to GPIO2.
 constexpr uint8_t DHT_PIN = 2;
@@ -19,6 +22,159 @@ unsigned long sampledAt = 0, disconnectedAt = 0;
 bool disconnected = false;
 String hostname;
 RecentHistory history;
+// RTC offsets are 4-byte words. Keep clear of the first 128 bytes used by OTA.
+constexpr uint32_t RESTART_RTC_OFFSET = 64;
+RestartRecord restartRecord = {};
+RestartIntent previousRestartIntent = RestartIntent::None;
+bool rtcRecordValid = false, rtcWriteOK = false;
+String bootResetReason, bootResetInfo;
+uint32_t minFreeHeap = UINT32_MAX, wifiDisconnects = 0;
+constexpr uint32_t MIN_FREE_HEAP = 8192;
+constexpr uint32_t MIN_FREE_BLOCK = 4096;
+HistoryImport historyImport;
+bool importAuthenticated = false, importComplete = false;
+bool importDoneThisRequest = false;
+bool importStarted = false, importMultipleFiles = false;
+uint32_t historyRestores = 0, lowMemoryResponses = 0;
+char historyOutput[1024];
+struct HeapSample { uint32_t uptime, freeHeap, largestBlock; uint8_t fragmentation, wifiStatus; };
+constexpr uint8_t HEAP_SAMPLES = 48;
+HeapSample heapSamples[HEAP_SAMPLES] = {};
+uint8_t heapNext = 0, heapCount = 0;
+uint32_t lastHeapSample = 0;
+static_assert(sizeof(history) + sizeof(historyImport) + sizeof(heapSamples) + sizeof(historyOutput) <= 10000,
+  "History, restore staging and debug buffers must remain bounded");
+
+bool memoryAvailable() {
+  if (ESP.getFreeHeap() >= MIN_FREE_HEAP && ESP.getMaxFreeBlockSize() >= MIN_FREE_BLOCK) return true;
+  ++lowMemoryResponses;
+  server.send(503, "application/json", "{\"error\":\"low_memory\"}");
+  return false;
+}
+
+void collectHeapSample() {
+  const uint32_t freeHeap = ESP.getFreeHeap();
+  if (freeHeap < minFreeHeap) minFreeHeap = freeHeap;
+  if (!heapCount || millis() - lastHeapSample >= 60000) {
+    lastHeapSample = millis();
+    heapSamples[heapNext] = {lastHeapSample, freeHeap, ESP.getMaxFreeBlockSize(),
+      ESP.getHeapFragmentation(), uint8_t(WiFi.status())};
+    heapNext = (heapNext + 1) % HEAP_SAMPLES;
+    if (heapCount < HEAP_SAMPLES) ++heapCount;
+  }
+}
+
+void receiveHistory() {
+  HTTPUpload& upload = server.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    if (importStarted) { importMultipleFiles = true; return; }
+    importStarted = true;
+    importAuthenticated = upload.contentLength <= 6000 && server.authenticateDigest("history", HISTORY_AUTH_HASH);
+    importComplete = false;
+    importDoneThisRequest = false;
+    historyImport.begin(millis());
+  } else if (upload.status == UPLOAD_FILE_WRITE && importAuthenticated && !importDoneThisRequest) {
+    historyImport.feed(upload.buf, upload.currentSize);
+  } else if (upload.status == UPLOAD_FILE_END && importAuthenticated) {
+    // Multiple files are rejected by the request completion handler.
+    importComplete = !importDoneThisRequest && historyImport.complete();
+    importDoneThisRequest = true;
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    importComplete = false; importStarted = false; importAuthenticated = false; importMultipleFiles = false;
+  }
+}
+
+void finishHistoryRestore() {
+  const bool complete = importStarted && importAuthenticated && importComplete && !importMultipleFiles;
+  importStarted = false; importMultipleFiles = false; importComplete = false;
+  if (!server.authenticateDigest("history", HISTORY_AUTH_HASH)) {
+    server.requestAuthentication(DIGEST_AUTH, "humidity-history"); return;
+  }
+  if (!complete) {
+    server.send(400, "application/json", "{\"error\":\"invalid_history\"}"); return;
+  }
+  // Only replace the live buffer after the complete, bounded import is validated.
+  history = historyImport.staged();
+  ++historyRestores;
+  server.send(200, "application/json", "{\"restored\":" + String(history.size()) + "}");
+  importComplete = false;
+}
+
+void sendHeapHistory() {
+  if (!memoryAvailable()) return;
+  server.sendHeader("Cache-Control", "no-store");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
+  server.sendContent("{\"capacity\":48,\"interval_ms\":60000,\"samples\":[");
+  char row[192];
+  for (uint8_t i = 0; i < heapCount; ++i) {
+    const HeapSample& sample = heapSamples[(heapNext + HEAP_SAMPLES - heapCount + i) % HEAP_SAMPLES];
+    snprintf(row, sizeof(row), "%s{\"uptime_ms\":%lu,\"free_heap_bytes\":%lu,\"largest_free_block_bytes\":%lu,\"fragmentation_percent\":%u,\"wifi_status\":%u}",
+      i ? "," : "", (unsigned long)sample.uptime, (unsigned long)sample.freeHeap,
+      (unsigned long)sample.largestBlock, sample.fragmentation, sample.wifiStatus);
+    server.sendContent(row); yield();
+  }
+  server.sendContent("]}"); server.sendContent("");
+}
+
+void markRestart(RestartIntent intent) {
+  restartRecord = makeRestartRecord(restartRecord.boots, intent);
+  rtcWriteOK = ESP.rtcUserMemoryWrite(RESTART_RTC_OFFSET,
+    reinterpret_cast<uint32_t*>(&restartRecord), sizeof(restartRecord));
+}
+
+void appendJsonString(String& json, const String& value) {
+  json += '"';
+  for (unsigned i = 0; i < value.length(); ++i) {
+    const uint8_t c = value[i];
+    if (c == '"' || c == '\\') { json += '\\'; json += char(c); }
+    else if (c < 32) {
+      const char hex[] = "0123456789abcdef";
+      json += "\\u00"; json += hex[c >> 4]; json += hex[c & 15];
+    } else json += char(c);
+  }
+  json += '"';
+}
+
+void sendDiagnostics() {
+  collectHeapSample();
+  const uint32_t freeHeap = ESP.getFreeHeap();
+  const uint32_t largestBlock = ESP.getMaxFreeBlockSize();
+  const uint8_t fragmentation = ESP.getHeapFragmentation();
+  String json;
+  if (!json.reserve(3072)) {
+    server.send(503, "application/json", "{\"error\":\"diagnostics_allocation_failed\"}"); return;
+  }
+  json = "{\"reset_reason\":"; appendJsonString(json, bootResetReason);
+  json += ",\"reset_info\":"; appendJsonString(json, bootResetInfo);
+  json += ",\"previous_restart_intent\":";
+  appendJsonString(json, restartIntentName(previousRestartIntent));
+  json += ",\"rtc_record_valid_at_boot\":"; json += rtcRecordValid ? "true" : "false";
+  json += ",\"rtc_write_ok\":"; json += rtcWriteOK ? "true" : "false";
+  json += ",\"boot_count_rtc\":" + String(restartRecord.boots);
+  json += ",\"uptime_ms\":" + String(millis());
+  json += ",\"free_heap_bytes\":" + String(freeHeap);
+  json += ",\"min_observed_free_heap_bytes\":" + String(minFreeHeap);
+  json += ",\"largest_free_block_bytes\":" + String(largestBlock);
+  json += ",\"heap_fragmentation_percent\":" + String(fragmentation);
+  json += ",\"wifi_disconnects_observed\":" + String(wifiDisconnects);
+  json += ",\"wifi_status\":" + String(unsigned(WiFi.status()));
+  json += ",\"wifi_rssi_dbm\":" + String(WiFi.RSSI());
+  json += ",\"wifi_sleep_mode\":" + String(unsigned(WiFi.getSleepMode())) + "}";
+  json.remove(json.length() - 1);
+  json += ",\"history_count\":" + String(history.size());
+  json += ",\"history_capacity\":" + String(RecentHistory::CAPACITY);
+  json += ",\"history_buffer_bytes\":" + String(sizeof(history));
+  json += ",\"history_import_buffer_bytes\":" + String(sizeof(historyImport));
+  json += ",\"heap_log_capacity\":" + String(HEAP_SAMPLES);
+  json += ",\"heap_log_bytes\":" + String(sizeof(heapSamples));
+  json += ",\"history_restores\":" + String(historyRestores);
+  json += ",\"low_memory_responses\":" + String(lowMemoryResponses);
+  json += ",\"free_sketch_space\":" + String(ESP.getFreeSketchSpace());
+  json += ",\"free_stack_bytes\":" + String(ESP.getFreeContStack()) + "}";
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", json);
+}
 
 const char PAGE[] PROGMEM = R"HTML(<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
@@ -87,35 +243,41 @@ void sampleSensor() {
   humidity = dht.readHumidity();
   temperature = dht.readTemperature();
   sampledAt = millis();
-  sampleOK = !isnan(humidity) && !isnan(temperature);
+  sampleOK = isfinite(humidity) && isfinite(temperature) && humidity >= 0 && humidity <= 100 &&
+    temperature >= -50 && temperature <= 100;
   // Failed samples remain gaps in history rather than reusing old readings.
   history.addIfDue(sampledAt, sampleOK ? humidity : NAN, sampleOK ? temperature : NAN);
 }
 
 void sendHistory() {
+  if (!memoryAvailable()) return;
   const uint32_t now = millis();
   server.sendHeader("Cache-Control", "no-store");
   server.setContentLength(CONTENT_LENGTH_UNKNOWN);
   server.send(200, "application/json", "");
   server.sendContent("{\"interval_ms\":300000,\"window_ms\":86400000,\"readings\":[");
-  String chunk;
-  chunk.reserve(1800);
+  size_t outputUsed = 0;
   bool first = true;
   for (uint16_t i = 0; i < history.size(); ++i) {
     const HistoryReading& point = history.at(i);
     const uint32_t age = now - point.sampledAt;
     if (age > RecentHistory::WINDOW_MS) continue;
-    if (!first) chunk += ',';
+    char humidityText[16], temperatureText[16], row[144];
+    if (isnan(point.humidity)) strcpy(humidityText, "null");
+    else dtostrf(point.humidity, 0, 1, humidityText);
+    if (isnan(point.temperature)) strcpy(temperatureText, "null");
+    else dtostrf(point.temperature, 0, 1, temperatureText);
+    const int length = snprintf(row, sizeof(row), "%s{\"age_ms\":%lu,\"humidity_percent\":%s,\"temperature_c\":%s}",
+      first ? "" : ",", (unsigned long)age, humidityText, temperatureText);
+    if (length < 0 || size_t(length) >= sizeof(row)) break;
     first = false;
-    chunk += "{\"age_ms\":" + String(age) + ",\"humidity_percent\":";
-    chunk += isnan(point.humidity) ? "null" : String(point.humidity, 1);
-    chunk += ",\"temperature_c\":";
-    chunk += isnan(point.temperature) ? "null" : String(point.temperature, 1);
-    chunk += '}';
-    if (chunk.length() > 1500) { server.sendContent(chunk); chunk = ""; yield(); }
+    if (outputUsed + size_t(length) > sizeof(historyOutput)) {
+      server.sendContent(historyOutput, outputUsed); outputUsed = 0; yield();
+    }
+    memcpy(historyOutput + outputUsed, row, length); outputUsed += length;
   }
-  chunk += "]}";
-  server.sendContent(chunk);
+  if (outputUsed) server.sendContent(historyOutput, outputUsed);
+  server.sendContent("]}");
   server.sendContent("");
 }
 
@@ -135,6 +297,14 @@ void sendReadings() {
 }
 
 void setup() {
+  bootResetReason = ESP.getResetReason();
+  bootResetInfo = ESP.getResetInfo();
+  rtcRecordValid = ESP.rtcUserMemoryRead(RESTART_RTC_OFFSET,
+    reinterpret_cast<uint32_t*>(&restartRecord), sizeof(restartRecord)) && validRestartRecord(restartRecord);
+  if (!rtcRecordValid) restartRecord = {};
+  previousRestartIntent = beginBootRecord(restartRecord);
+  markRestart(RestartIntent::None);
+  minFreeHeap = ESP.getFreeHeap();
   Serial.begin(115200);
   Serial.println();
   hostname = "humidity-" + String(ESP.getChipId(), HEX);
@@ -152,6 +322,7 @@ void setup() {
   if (!manager.autoConnect(apName.c_str(), "humidity-setup")) {
     Serial.println("Setup timed out; restarting.");
     delay(1000);
+    markRestart(RestartIntent::SetupTimeout);
     ESP.restart();
     return;
   }
@@ -164,20 +335,27 @@ void setup() {
   ArduinoOTA.setPort(8266);
   ArduinoOTA.setPasswordHash(OTA_PASSWORD_HASH);
   ArduinoOTA.onStart([]() { Serial.println("Authenticated OTA update starting."); });
-  ArduinoOTA.onEnd([]() { Serial.println("OTA complete; restarting."); });
+  ArduinoOTA.onEnd([]() {
+    markRestart(RestartIntent::OtaUpdate);
+    Serial.println("OTA complete; restarting.");
+  });
   ArduinoOTA.onError([](ota_error_t error) {
     Serial.printf("OTA failed (error %u); sensor continues running.\n", unsigned(error));
   });
   ArduinoOTA.begin(); // Starts authenticated OTA and mDNS discovery.
   MDNS.addService("http", "tcp", 80);
   server.on("/", HTTP_GET, []() {
+    if (!memoryAvailable()) return;
     server.sendHeader("Cache-Control", "no-store");
     server.send_P(200, "text/html; charset=utf-8", PAGE);
   });
   server.on("/api/readings", HTTP_GET, sendReadings);
   server.on("/api/history", HTTP_GET, sendHistory);
+  server.on("/api/diagnostics", HTTP_GET, sendDiagnostics);
+  server.on("/api/debug/heap", HTTP_GET, sendHeapHistory);
+  server.on("/api/history/restore", HTTP_POST, finishHistoryRestore, receiveHistory);
   server.on("/api/device", HTTP_GET, []() {
-    String json = "{\"firmware\":\"history-uptime-v4\",\"ota_enabled\":true,\"hostname\":\"";
+    String json = "{\"firmware\":\"history-uptime-v6\",\"ota_enabled\":true,\"history_restore\":true,\"hostname\":\"";
     json += hostname + "\",\"sketch_size\":" + String(ESP.getSketchSize());
     json += ",\"free_sketch_space\":" + String(ESP.getFreeSketchSpace());
     json += ",\"wifi_sleep_mode\":" + String(unsigned(WiFi.getSleepMode()));
@@ -193,15 +371,19 @@ void setup() {
 }
 
 void loop() {
+  collectHeapSample();
   ArduinoOTA.handle(); // Includes mDNS updates; sampling pauses during an upload.
   server.handleClient();
   if (millis() - sampledAt >= SAMPLE_MS) sampleSensor();
   if (WiFi.status() == WL_CONNECTED) {
     disconnected = false;
   } else {
-    if (!disconnected) { disconnectedAt = millis(); disconnected = true; }
+    if (!disconnected) { disconnectedAt = millis(); disconnected = true; ++wifiDisconnects; }
     // Reopen the setup portal after a prolonged outage or changed Wi-Fi.
-    if (millis() - disconnectedAt >= 180000) ESP.restart();
+    if (millis() - disconnectedAt >= 180000) {
+      markRestart(RestartIntent::WifiTimeout);
+      ESP.restart();
+    }
   }
   // Allow a full router beacon interval for sleep; requests wait at most one second.
   delay(1000);

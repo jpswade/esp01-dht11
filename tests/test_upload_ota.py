@@ -27,7 +27,7 @@ class UploadPreflightTests(unittest.TestCase):
         self.uploader_path = self.project / "espota.py"
         self.uploader_path.touch()
 
-    def upload(self, firmware="history-uptime-v4", hostname="humidity-test", expected=None):
+    def upload(self, firmware="history-uptime-v4", hostname="humidity-test", expected=None, preserve=False):
         device = dict(firmware=firmware, hostname=hostname, ota_enabled=True, free_sketch_space=1000000)
         opener = Mock()
         opener.open.return_value = io.BytesIO(json.dumps(device).encode())
@@ -36,6 +36,8 @@ class UploadPreflightTests(unittest.TestCase):
         argv = ["upload_ota.py", "--host", "192.0.2.1", "--espota", str(self.uploader_path)]
         if expected:
             argv += ["--expected-hostname", expected]
+        if preserve:
+            argv += ["--preserve-history"]
         spec = Mock()
         with patch("sys.argv", argv), \
              patch.object(self.module.socket, "gethostbyname", return_value="192.0.2.1"), \
@@ -70,6 +72,10 @@ class UploadPreflightTests(unittest.TestCase):
         self.image.write_bytes(b"image made with a different password")
         with self.assertRaises(SystemExit):
             self.upload()
+
+    def test_preservation_refuses_an_image_without_restore_support(self):
+        with self.assertRaises(SystemExit):
+            self.upload(preserve=True)
 
 
 if __name__ == "__main__":
